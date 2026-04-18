@@ -1600,25 +1600,48 @@ fn check_auth_health() -> DiagnosticCheck {
     let auth_token_present = env::var("ANTHROPIC_AUTH_TOKEN")
         .ok()
         .is_some_and(|value| !value.trim().is_empty());
-    let env_details = format!(
-        "Environment       api_key={} auth_token={}",
-        if api_key_present { "present" } else { "absent" },
-        if auth_token_present {
-            "present"
-        } else {
-            "absent"
-        }
-    );
+    let bedrock_mode = api::is_bedrock_mode();
+    let bedrock_token_present = env::var("AWS_BEARER_TOKEN_BEDROCK")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    let any_auth_present =
+        api_key_present || auth_token_present || (bedrock_mode && bedrock_token_present);
+    let env_details = if bedrock_mode {
+        format!(
+            "Environment       api_key={} auth_token={} bedrock_mode=true bedrock_token={}",
+            if api_key_present { "present" } else { "absent" },
+            if auth_token_present {
+                "present"
+            } else {
+                "absent"
+            },
+            if bedrock_token_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )
+    } else {
+        format!(
+            "Environment       api_key={} auth_token={}",
+            if api_key_present { "present" } else { "absent" },
+            if auth_token_present {
+                "present"
+            } else {
+                "absent"
+            }
+        )
+    };
 
     match load_oauth_credentials() {
         Ok(Some(token_set)) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 "supported auth env vars are configured; legacy saved OAuth is ignored"
             } else {
                 "legacy saved OAuth credentials are present but unsupported"
@@ -1648,6 +1671,11 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("bedrock_mode".to_string(), json!(bedrock_mode)),
+            (
+                "bedrock_token_present".to_string(),
+                json!(bedrock_token_present),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(true)),
             (
                 "legacy_saved_oauth_expires_at".to_string(),
@@ -1661,12 +1689,12 @@ fn check_auth_health() -> DiagnosticCheck {
         ])),
         Ok(None) => DiagnosticCheck::new(
             "Auth",
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 DiagnosticLevel::Ok
             } else {
                 DiagnosticLevel::Warn
             },
-            if api_key_present || auth_token_present {
+            if any_auth_present {
                 "supported auth env vars are configured"
             } else {
                 "no supported auth env vars were found"
@@ -1676,6 +1704,11 @@ fn check_auth_health() -> DiagnosticCheck {
         .with_data(Map::from_iter([
             ("api_key_present".to_string(), json!(api_key_present)),
             ("auth_token_present".to_string(), json!(auth_token_present)),
+            ("bedrock_mode".to_string(), json!(bedrock_mode)),
+            (
+                "bedrock_token_present".to_string(),
+                json!(bedrock_token_present),
+            ),
             ("legacy_saved_oauth_present".to_string(), json!(false)),
             ("legacy_saved_oauth_expires_at".to_string(), Value::Null),
             ("legacy_refresh_token_present".to_string(), json!(false)),

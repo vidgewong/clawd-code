@@ -24,6 +24,8 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[tokio::test]
 async fn send_message_posts_json_and_parses_response() {
+    let _guard = env_lock();
+    std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let body = concat!(
         "{",
@@ -459,6 +461,8 @@ async fn retries_retryable_failures_before_succeeding() {
 
 #[tokio::test]
 async fn provider_client_dispatches_anthropic_requests() {
+    let _guard = env_lock();
+    std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
     let server = spawn_server(
         state.clone(),

@@ -44,7 +44,18 @@ impl AuthSource {
     pub fn from_env() -> Result<Self, ApiError> {
         let api_key = read_env_non_empty("ANTHROPIC_API_KEY")?;
         let auth_token = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?;
-        match (api_key, auth_token) {
+        // In Bedrock mode, fall back to AWS_BEARER_TOKEN_BEDROCK when no
+        // standard Anthropic credentials are present.
+        let effective_token = auth_token.or_else(|| {
+            if is_bedrock_mode() {
+                read_env_non_empty("AWS_BEARER_TOKEN_BEDROCK")
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        });
+        match (api_key, effective_token) {
             (Some(api_key), Some(bearer_token)) => Ok(Self::ApiKeyAndBearer {
                 api_key,
                 bearer_token,
@@ -467,9 +478,29 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
-        let request_url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let mut request_body = self.request_profile.render_json_body(request)?;
         strip_unsupported_beta_body_fields(&mut request_body);
+
+        let request_url = if is_bedrock_mode() {
+            let model_id = bedrock_model_id(&request.model);
+            prepare_bedrock_body(&mut request_body);
+            if request.stream {
+                format!(
+                    "{}/model/{}/invoke-with-response-stream",
+                    self.base_url.trim_end_matches('/'),
+                    model_id
+                )
+            } else {
+                format!(
+                    "{}/model/{}/invoke",
+                    self.base_url.trim_end_matches('/'),
+                    model_id
+                )
+            }
+        } else {
+            format!("{}/v1/messages", self.base_url.trim_end_matches('/'))
+        };
+
         let request_builder = self.build_request(&request_url).json(&request_body);
         request_builder.send().await.map_err(ApiError::from)
     }
@@ -502,6 +533,10 @@ impl AnthropicClient {
         // Best-effort refinement using the Anthropic count_tokens endpoint.
         // On any failure (network, parse, auth), fall back to the local
         // byte-estimate result which already passed above.
+        // Bedrock does not expose the count_tokens endpoint, so skip it.
+        if is_bedrock_mode() {
+            return Ok(());
+        }
         let Ok(counted_input_tokens) = self.count_tokens(request).await else {
             return Ok(());
         };
@@ -630,6 +665,12 @@ impl AuthSource {
         if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
             return Ok(Self::BearerToken(bearer_token));
         }
+        // Bedrock fallback: use AWS_BEARER_TOKEN_BEDROCK as a bearer token.
+        if is_bedrock_mode() {
+            if let Some(bedrock_token) = read_env_non_empty("AWS_BEARER_TOKEN_BEDROCK")? {
+                return Ok(Self::BearerToken(bedrock_token));
+            }
+        }
         Err(anthropic_missing_credentials())
     }
 }
@@ -650,7 +691,8 @@ pub fn resolve_saved_oauth_token(config: &OAuthConfig) -> Result<Option<OAuthTok
 
 pub fn has_auth_from_env_or_saved() -> Result<bool, ApiError> {
     Ok(read_env_non_empty("ANTHROPIC_API_KEY")?.is_some()
-        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some())
+        || read_env_non_empty("ANTHROPIC_AUTH_TOKEN")?.is_some()
+        || (is_bedrock_mode() && read_env_non_empty("AWS_BEARER_TOKEN_BEDROCK")?.is_some()))
 }
 
 pub fn resolve_startup_auth_source<F>(load_oauth_config: F) -> Result<AuthSource, ApiError>
@@ -669,6 +711,12 @@ where
     }
     if let Some(bearer_token) = read_env_non_empty("ANTHROPIC_AUTH_TOKEN")? {
         return Ok(AuthSource::BearerToken(bearer_token));
+    }
+    // Bedrock fallback: use AWS_BEARER_TOKEN_BEDROCK as a bearer token.
+    if is_bedrock_mode() {
+        if let Some(bedrock_token) = read_env_non_empty("AWS_BEARER_TOKEN_BEDROCK")? {
+            return Ok(AuthSource::BearerToken(bedrock_token));
+        }
     }
     Err(anthropic_missing_credentials())
 }
@@ -761,9 +809,65 @@ fn read_auth_token() -> Option<String> {
         .and_then(std::convert::identity)
 }
 
+/// Returns `true` when `CLAUDE_CODE_USE_BEDROCK` is set to a truthy value
+/// (`1`, `true`, `yes`), signalling that the CLI should authenticate against
+/// an AWS Bedrock-compatible proxy instead of the direct Anthropic API.
+#[must_use]
+pub fn is_bedrock_mode() -> bool {
+    std::env::var("CLAUDE_CODE_USE_BEDROCK")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+}
+
 #[must_use]
 pub fn read_base_url() -> String {
+    if is_bedrock_mode() {
+        if let Ok(url) = std::env::var("ANTHROPIC_BEDROCK_BASE_URL") {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
     std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+}
+
+/// Map an Anthropic model name to the corresponding AWS Bedrock model ID.
+/// Falls back to `BEDROCK_MODEL_ID` env var, then uses the model name as-is.
+#[must_use]
+pub fn bedrock_model_id(model: &str) -> String {
+    // Allow explicit override via env var.
+    if let Ok(id) = std::env::var("BEDROCK_MODEL_ID") {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    // Known Anthropic → Bedrock ID mappings.
+    match model {
+        "claude-opus-4-6" => "us.anthropic.claude-opus-4-6-20250605-v1:0",
+        "claude-sonnet-4-6" => "us.anthropic.claude-sonnet-4-6-20250514-v1:0",
+        "claude-opus-4-20250514" => "us.anthropic.claude-opus-4-20250514-v1:0",
+        "claude-sonnet-4-20250514" => "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "claude-haiku-4-5-20251213" | "claude-haiku-4-5-20251001" => {
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+        }
+        "claude-sonnet-4-5-20250514" => "us.anthropic.claude-sonnet-4-5-20250514-v1:0",
+        _ => return model.to_string(),
+    }
+    .to_string()
+}
+
+/// Adjust a JSON request body for the Bedrock invoke API: remove the `model`
+/// field (it is part of the URL path on Bedrock) and inject the required
+/// `anthropic_version` header value.
+fn prepare_bedrock_body(body: &mut Value) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("model");
+        obj.remove("stream");
+        obj.insert(
+            "anthropic_version".to_string(),
+            Value::String("bedrock-2023-05-31".to_string()),
+        );
+    }
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1087,6 +1191,7 @@ mod tests {
         let _guard = env_lock();
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
         std::env::remove_var("CLAW_CONFIG_HOME");
         let error = super::read_api_key().expect_err("missing key should error");
         assert!(matches!(
@@ -1100,6 +1205,7 @@ mod tests {
         let _guard = env_lock();
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
         let error = super::read_api_key().expect_err("empty key should error");
         assert!(matches!(
             error,
@@ -1160,6 +1266,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
@@ -1231,6 +1338,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("CLAUDE_CODE_USE_BEDROCK");
         save_oauth_credentials(&runtime::OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
